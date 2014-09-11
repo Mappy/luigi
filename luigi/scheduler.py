@@ -128,8 +128,22 @@ class SimpleTaskState(object):
         # In the future the point is to limit the type of access to state by having a strict interface
         return self._tasks
 
-    def get_workers(self):
-        return self._active_workers
+    def get_workers(self, last_active_lt=None):
+        for worker in self._active_workers.itervalues():
+            if last_active_lt is not None and worker.last_active >= last_active_lt:
+                continue
+            yield worker
+
+    def get_worker_ids(self):
+        return self._active_workers.keys() # only used for unit tests
+
+    def get_worker(self, worker_id):
+        return self._active_workers.setdefault(worker_id, Worker(worker_id))
+
+    def inactivate_workers(self, delete_workers):
+        # Mark workers as inactive
+        for worker in delete_workers:
+            self._active_workers.pop(worker)
         
 
 class CentralPlannerScheduler(Scheduler):
@@ -160,31 +174,27 @@ class CentralPlannerScheduler(Scheduler):
     def dump(self):
         self._state.dump()
 
-    def get_workers(self): # TODO: remove this method (currently needed for unit tests)
-        return self._state.get_workers()
-
     def prune(self):
         logger.info("Starting pruning of task graph")
         # Delete workers that haven't said anything for a while (probably killed)
         delete_workers = []
-        for worker in self._state.get_workers().values():
-            if worker.last_active < time.time() - self._worker_disconnect_delay:
-                logger.info("Worker %s timed out (no contact for >=%ss)", worker, self._worker_disconnect_delay)
-                delete_workers.append(worker.id)
+        for worker in self._state.get_workers(last_active_lt=time.time() - self._worker_disconnect_delay):
+            logger.info("Worker %s timed out (no contact for >=%ss)", worker, self._worker_disconnect_delay)
+            delete_workers.append(worker.id)
 
-        for worker in delete_workers:
-            self._state.get_workers().pop(worker)
+        self._state.inactivate_workers(delete_workers)
 
-        remaining_workers = set(self._state.get_workers().keys())
+        delete_workers = set(delete_workers)
 
         # Mark tasks with no remaining active stakeholders for deletion
         for task_id, task in self._state.get_tasks().iteritems():
-            if not task.stakeholders.intersection(remaining_workers):
+            task.stakeholders.difference_update(delete_workers)
+            if not task.stakeholders:
                 if task.remove is None:
                     logger.info("Task %r has stakeholders %r but none remain connected -> will remove task in %s seconds", task_id, task.stakeholders, self._remove_delay)
                     task.remove = time.time() + self._remove_delay
 
-            if task.status == RUNNING and task.worker_running and task.worker_running not in remaining_workers:
+            if task.status == RUNNING and task.worker_running and task.worker_running not in task.stakeholders:
                 # If a running worker disconnects, tag all its jobs as FAILED and subject it to the same retry logic
                 logger.info("Task %r is marked as running by disconnected worker %r -> marking as FAILED with retry delay of %rs", task_id, task.worker_running, self._retry_delay)
                 task.worker_running = None
@@ -209,7 +219,7 @@ class CentralPlannerScheduler(Scheduler):
 
     def update(self, worker_id, worker_reference=None):
         """ Keep track of whenever the worker was last active """
-        worker = self._state.get_workers().setdefault(worker_id, Worker(worker_id))
+        worker = self._state.get_worker(worker_id)
         if worker_reference:
             worker.reference = worker_reference
         worker.last_active = time.time()
@@ -251,7 +261,7 @@ class CentralPlannerScheduler(Scheduler):
             task.expl = expl
 
     def add_worker(self, worker, info):
-        self._state.get_workers()[worker].add_info(info)
+        self._state.get_worker(worker).add_info(info)
 
     def get_work(self, worker, host=None):
         # TODO: remove any expired nodes
@@ -276,7 +286,7 @@ class CentralPlannerScheduler(Scheduler):
             if task.status == RUNNING:
                 # Return a list of currently running tasks to the client,
                 # makes it easier to troubleshoot
-                other_worker = self._state.get_workers()[task.worker_running]
+                other_worker = self._state.get_worker(task.worker_running)
                 more_info = {'task_id': task_id, 'worker': str(other_worker)}
                 if other_worker is not None:
                     more_info.update(other_worker.info)
