@@ -37,7 +37,7 @@ class SchedulerTest(unittest.TestCase):
 
             scheduler.prune()
 
-            self.assertEquals(list(scheduler._active_workers.keys()),
+            self.assertEquals(list(scheduler.get_workers().keys()),
                               ['Worker2'])
 
     def test_load_broken_state(self):
@@ -49,7 +49,7 @@ class SchedulerTest(unittest.TestCase):
                 state_path=fn.name)
             scheduler.load()  # bad if this crashes
 
-            self.assertEquals(list(scheduler._active_workers.keys()), [])
+            self.assertEquals(list(scheduler.get_workers().keys()), [])
 
 
 if __name__ == '__main__':

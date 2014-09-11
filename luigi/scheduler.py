@@ -80,29 +80,16 @@ class Worker(object):
         return self.id
 
 
-class CentralPlannerScheduler(Scheduler):
-    ''' Async scheduler that can handle multiple workers etc
+class SimpleTaskState(object):
+    ''' Keep track of the current state and handle persistance
 
-    Can be run locally or on a server (using RemoteScheduler + server.Server).
+    The point of this class is to enable other ways to keep state, eg. by using a database
     '''
 
-    def __init__(self, retry_delay=900.0, remove_delay=600.0, worker_disconnect_delay=60.0,
-                 state_path='/var/lib/luigi-server/state.pickle', task_history=None):
-        '''
-        (all arguments are in seconds)
-        Keyword Arguments:
-        retry_delay -- How long after a Task fails to try it again, or -1 to never retry
-        remove_delay -- How long after a Task finishes to remove it from the scheduler
-        state_path -- Path to state file (tasks and active workers)
-        worker_disconnect_delay -- If a worker hasn't communicated for this long, remove it from active workers
-        '''
+    def __init__(self, state_path):
         self._state_path = state_path
         self._tasks = {}  # map from id to a Task object
-        self._retry_delay = retry_delay
-        self._remove_delay = remove_delay
-        self._worker_disconnect_delay = worker_disconnect_delay
         self._active_workers = {}  # map from id to a Worker object
-        self._task_history = task_history or history.NopHistory()
 
     def dump(self):
         state = (self._tasks, self._active_workers)
@@ -136,22 +123,62 @@ class CentralPlannerScheduler(Scheduler):
         else:
             logger.info("No prior state file exists at %s. Starting with clean slate", self._state_path)
 
+    def get_tasks(self):
+        # TODO: this is a workaround for now to support the current setup
+        # In the future the point is to limit the type of access to state by having a strict interface
+        return self._tasks
+
+    def get_workers(self):
+        return self._active_workers
+        
+
+class CentralPlannerScheduler(Scheduler):
+    ''' Async scheduler that can handle multiple workers etc
+
+    Can be run locally or on a server (using RemoteScheduler + server.Server).
+    '''
+
+    def __init__(self, retry_delay=900.0, remove_delay=600.0, worker_disconnect_delay=60.0,
+                 state_path='/var/lib/luigi-server/state.pickle', task_history=None):
+        '''
+        (all arguments are in seconds)
+        Keyword Arguments:
+        retry_delay -- How long after a Task fails to try it again, or -1 to never retry
+        remove_delay -- How long after a Task finishes to remove it from the scheduler
+        state_path -- Path to state file (tasks and active workers)
+        worker_disconnect_delay -- If a worker hasn't communicated for this long, remove it from active workers
+        '''
+        self._retry_delay = retry_delay
+        self._remove_delay = remove_delay
+        self._worker_disconnect_delay = worker_disconnect_delay
+        self._task_history = task_history or history.NopHistory()
+        self._state = SimpleTaskState(state_path)
+
+    def load(self):
+        self._state.load()
+
+    def dump(self):
+        self._state.dump()
+
+    def get_workers(self): # TODO: remove this method (currently needed for unit tests)
+        return self._state.get_workers()
+
     def prune(self):
         logger.info("Starting pruning of task graph")
         # Delete workers that haven't said anything for a while (probably killed)
         delete_workers = []
-        for worker in self._active_workers.values():
+        for worker in self._state.get_workers().values():
             if worker.last_active < time.time() - self._worker_disconnect_delay:
                 logger.info("Worker %s timed out (no contact for >=%ss)", worker, self._worker_disconnect_delay)
                 delete_workers.append(worker.id)
 
         for worker in delete_workers:
-            self._active_workers.pop(worker)
+            self._state.get_workers().pop(worker)
 
-        remaining_workers = set(self._active_workers.keys())
+        remaining_workers = set(self._state.get_workers().keys())
 
         # Mark tasks with no remaining active stakeholders for deletion
-        for task_id, task in self._tasks.iteritems():
+        for task_id, task in self._state.get_tasks().iteritems():
             if not task.stakeholders.intersection(remaining_workers):
                 if task.remove is None:
                     logger.info("Task %r has stakeholders %r but none remain connected -> will remove task in %s seconds", task_id, task.stakeholders, self._remove_delay)
@@ -166,23 +193,23 @@ class CentralPlannerScheduler(Scheduler):
 
         # Remove tasks that have no stakeholders
         remove_tasks = []
-        for task_id, task in self._tasks.iteritems():
+        for task_id, task in self._state.get_tasks().iteritems():
             if task.remove and time.time() > task.remove:
                 logger.info("Removing task %r (no connected stakeholders)", task_id)
                 remove_tasks.append(task_id)
 
         for task_id in remove_tasks:
-            self._tasks.pop(task_id)
+            self._state.get_tasks().pop(task_id)
 
         # Reset FAILED tasks to PENDING if max timeout is reached, and retry delay is >= 0
-        for task in self._tasks.values():
+        for task in self._state.get_tasks().values():
             if task.status == FAILED and self._retry_delay >= 0 and task.retry < time.time():
                 task.status = PENDING
         logger.info("Done pruning task graph")
 
     def update(self, worker_id, worker_reference=None):
         """ Keep track of whenever the worker was last active """
-        worker = self._active_workers.setdefault(worker_id, Worker(worker_id))
+        worker = self._state.get_workers().setdefault(worker_id, Worker(worker_id))
         if worker_reference:
             worker.reference = worker_reference
         worker.last_active = time.time()
@@ -196,7 +223,7 @@ class CentralPlannerScheduler(Scheduler):
         """
         self.update(worker)
 
-        task = self._tasks.setdefault(task_id, Task(status=PENDING, deps=deps, priority=priority, family=family, params=params))
+        task = self._state.get_tasks().setdefault(task_id, Task(status=PENDING, deps=deps, priority=priority, family=family, params=params))
 
         if task.remove is not None:
             task.remove = None  # unmark task for removal so it isn't removed after being added
@@ -224,7 +251,7 @@ class CentralPlannerScheduler(Scheduler):
             task.expl = expl
 
     def add_worker(self, worker, info):
-        self._active_workers[worker].add_info(info)
+        self._state.get_workers()[worker].add_info(info)
 
     def get_work(self, worker, host=None):
         # TODO: remove any expired nodes
@@ -242,14 +269,14 @@ class CentralPlannerScheduler(Scheduler):
         locally_pending_tasks = 0
         running_tasks = []
 
-        for task_id, task in self._tasks.iteritems():
+        for task_id, task in self._state.get_tasks().iteritems():
             if worker not in task.workers:
                 continue
 
             if task.status == RUNNING:
                 # Return a list of currently running tasks to the client,
                 # makes it easier to troubleshoot
-                other_worker = self._active_workers[task.worker_running]
+                other_worker = self._state.get_workers()[task.worker_running]
                 more_info = {'task_id': task_id, 'worker': str(other_worker)}
                 if other_worker is not None:
                     more_info.update(other_worker.info)
@@ -261,9 +288,9 @@ class CentralPlannerScheduler(Scheduler):
             locally_pending_tasks += 1
             ok = True
             for dep in task.deps:
-                if dep not in self._tasks:
+                if dep not in self._state.get_tasks():
                     ok = False
-                elif self._tasks[dep].status != DONE:
+                elif self._state.get_tasks()[dep].status != DONE:
                     ok = False
 
             if ok:
@@ -273,7 +300,7 @@ class CentralPlannerScheduler(Scheduler):
                     best_task = task_id
 
         if best_task:
-            t = self._tasks[best_task]
+            t = self._state.get_tasks()[best_task]
             t.status = RUNNING
             t.worker_running = worker
             t.time_running = time.time()
@@ -289,13 +316,13 @@ class CentralPlannerScheduler(Scheduler):
     def _upstream_status(self, task_id, upstream_status_table):
         if task_id in upstream_status_table:
             return upstream_status_table[task_id]
-        elif task_id in self._tasks:
+        elif task_id in self._state.get_tasks():
             task_stack = [task_id]
 
             while task_stack:
                 dep_id = task_stack.pop()
-                if dep_id in self._tasks:
-                    dep = self._tasks[dep_id]
+                if dep_id in self._state.get_tasks():
+                    dep = self._state.get_tasks()[dep_id]
                     if dep_id not in upstream_status_table:
                         if dep.status == PENDING and dep.deps:
                             task_stack = task_stack + [dep_id] + list(dep.deps)
@@ -313,7 +340,7 @@ class CentralPlannerScheduler(Scheduler):
             return upstream_status_table[dep_id]
 
     def _serialize_task(self, task_id):
-        task = self._tasks[task_id]
+        task = self._state.get_tasks()[task_id]
         return {
             'deps': list(task.deps),
             'status': task.status,
@@ -328,13 +355,13 @@ class CentralPlannerScheduler(Scheduler):
     def graph(self):
         self.prune()
         serialized = {}
-        for task_id, task in self._tasks.iteritems():
+        for task_id, task in self._state.get_tasks().iteritems():
             serialized[task_id] = self._serialize_task(task_id)
         return serialized
 
     def _recurse_deps(self, task_id, serialized):
         if task_id not in serialized:
-            task = self._tasks.get(task_id)
+            task = self._state.get_tasks().get(task_id)
             if task is None:
                 logger.warn('Missing task for id [%s]', task_id)
 
@@ -360,7 +387,7 @@ class CentralPlannerScheduler(Scheduler):
     def dep_graph(self, task_id):
         self.prune()
         serialized = {}
-        if task_id in self._tasks:
+        if task_id in self._state.get_tasks():
             self._recurse_deps(task_id, serialized)
         return serialized
 
@@ -369,7 +396,7 @@ class CentralPlannerScheduler(Scheduler):
         self.prune()
         result = {}
         upstream_status_table = {}  # used to memoize upstream status
-        for task_id, task in self._tasks.iteritems():
+        for task_id, task in self._state.get_tasks().iteritems():
             if not status or task.status == status:
                 if (task.status != PENDING or not upstream_status or
                     upstream_status == self._upstream_status(task_id, upstream_status_table)):
@@ -380,7 +407,7 @@ class CentralPlannerScheduler(Scheduler):
     def inverse_dependencies(self, task_id):
         self.prune()
         serialized = {}
-        if task_id in self._tasks:
+        if task_id in self._state.get_tasks():
             self._traverse_inverse_deps(task_id, serialized)
         return serialized
 
@@ -389,7 +416,7 @@ class CentralPlannerScheduler(Scheduler):
         serialized[task_id] = self._serialize_task(task_id)
         while len(stack) > 0:
             curr_id = stack.pop()
-            for id, task in self._tasks.iteritems():
+            for id, task in self._state.get_tasks().iteritems():
                 if curr_id in task.deps:
                     serialized[curr_id]["deps"].append(id)
                     if id not in serialized:
@@ -401,15 +428,15 @@ class CentralPlannerScheduler(Scheduler):
         ''' query for a subset of tasks by task_id '''
         self.prune()
         result = collections.defaultdict(dict)
-        for task_id, task in self._tasks.iteritems():
+        for task_id, task in self._state.get_tasks().iteritems():
             if task_id.find(task_str) != -1:
                 serialized = self._serialize_task(task_id)
                 result[task.status][task_id] = serialized
         return result
 
     def fetch_error(self, task_id):
-        if self._tasks[task_id].expl is not None:
-            return {"taskId": task_id, "error": self._tasks[task_id].expl}
+        if self._state.get_tasks()[task_id].expl is not None:
+            return {"taskId": task_id, "error": self._state.get_tasks()[task_id].expl}
         else:
             return {"taskId": task_id, "error": ""}
 
