@@ -126,9 +126,17 @@ class SimpleTaskState(object):
         else:
             logger.info("No prior state file exists at %s. Starting with clean slate", self._state_path)
 
-    def get_active_tasks(self):
-        for task in self._tasks.itervalues():
-            yield task
+    def get_active_tasks(self, worker_id=None, sort_by_prio=False):
+        if not sort_by_prio:
+            for task in self._tasks.itervalues():
+                if worker_id is None or worker_id in task.workers:
+                    yield task
+        else:
+            # Note if we are iterating on a SQL result we could rely on keys
+            tasks = [t for t in self._tasks.values() if worker_id is None or worker_id in t.workers]
+            tasks.sort(key=lambda task: (-task.priority, task.time))
+            for task in tasks:
+                yield task
 
     def get_task(self, task_id, default=None, setdefault=None):
         if setdefault:
@@ -204,34 +212,34 @@ class CentralPlannerScheduler(Scheduler):
 
         delete_workers = set(delete_workers)
 
-        # Mark tasks with no remaining active stakeholders for deletion
+        remove_tasks = []
         for task in self._state.get_active_tasks():
+            # Mark tasks with no remaining active stakeholders for deletion
             task.stakeholders.difference_update(delete_workers)
             if not task.stakeholders:
                 if task.remove is None:
                     logger.info("Task %r has stakeholders %r but none remain connected -> will remove task in %s seconds", task.id, task.stakeholders, self._remove_delay)
                     task.remove = time.time() + self._remove_delay
 
+            # If a running worker disconnects, tag all its jobs as FAILED and subject it to the same retry logic
             if task.status == RUNNING and task.worker_running and task.worker_running not in task.stakeholders:
-                # If a running worker disconnects, tag all its jobs as FAILED and subject it to the same retry logic
                 logger.info("Task %r is marked as running by disconnected worker %r -> marking as FAILED with retry delay of %rs", task.id, task.worker_running, self._retry_delay)
                 task.worker_running = None
                 task.status = FAILED
                 task.retry = time.time() + self._retry_delay
 
-        # Remove tasks that have no stakeholders
-        remove_tasks = []
-        for task in self._state.get_active_tasks():
+            # Remove tasks that have no stakeholders
             if task.remove and time.time() > task.remove:
                 logger.info("Removing task %r (no connected stakeholders)", task.id)
                 remove_tasks.append(task.id)
 
+            # Reset FAILED tasks to PENDING if max timeout is reached, and retry delay is >= 0
+            for task in self._state.get_active_tasks():
+                if task.status == FAILED and self._retry_delay >= 0 and task.retry < time.time():
+                    task.status = PENDING
+
         self._state.inactivate_tasks(remove_tasks)
 
-        # Reset FAILED tasks to PENDING if max timeout is reached, and retry delay is >= 0
-        for task in self._state.get_active_tasks():
-            if task.status == FAILED and self._retry_delay >= 0 and task.retry < time.time():
-                task.status = PENDING
         logger.info("Done pruning task graph")
 
     def update(self, worker_id, worker_reference=None):
@@ -290,16 +298,12 @@ class CentralPlannerScheduler(Scheduler):
 
         # Return remaining tasks that have no FAILED descendents
         self.update(worker, {'host': host})
-        best_t = float('inf')
-        best_priority = float('-inf')
+        best_task_id = None
         best_task = None
         locally_pending_tasks = 0
         running_tasks = []
 
-        for task in self._state.get_active_tasks():
-            if worker not in task.workers:
-                continue
-
+        for task in self._state.get_active_tasks(worker_id=worker, sort_by_prio=True):
             if task.status == RUNNING:
                 # Return a list of currently running tasks to the client,
                 # makes it easier to troubleshoot
@@ -321,20 +325,18 @@ class CentralPlannerScheduler(Scheduler):
                     ok = False
 
             if ok:
-                if (-task.priority, task.time) < (-best_priority, best_t):
-                    best_t = task.time
-                    best_priority = task.priority
-                    best_task = task.id
+                best_task_id = task.id
+                best_task = task
+                break
 
         if best_task:
-            t = self._state.get_task(best_task)
-            t.status = RUNNING
-            t.worker_running = worker
-            t.time_running = time.time()
-            self._update_task_history(best_task, RUNNING, host=host)
+            best_task.status = RUNNING
+            best_task.worker_running = worker
+            best_task.time_running = time.time()
+            self._update_task_history(best_task_id, RUNNING, host=host)
 
         return {'n_pending_tasks': locally_pending_tasks,
-                'task_id': best_task,
+                'task_id': best_task_id,
                 'running_tasks': running_tasks}
 
     def ping(self, worker):
