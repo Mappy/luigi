@@ -85,6 +85,8 @@ class SimpleTaskState(object):
     ''' Keep track of the current state and handle persistance
 
     The point of this class is to enable other ways to keep state, eg. by using a database
+    These will be implemented by creating an abstract base class that this and other classes
+    inherit from.
     '''
 
     def __init__(self, state_path):
@@ -124,7 +126,7 @@ class SimpleTaskState(object):
         else:
             logger.info("No prior state file exists at %s. Starting with clean slate", self._state_path)
 
-    def get_tasks(self):
+    def get_active_tasks(self):
         for task in self._tasks.itervalues():
             yield task
 
@@ -138,10 +140,13 @@ class SimpleTaskState(object):
         return task_id in self._tasks
 
     def inactivate_tasks(self, delete_tasks):
+        # The terminology is a bit confusing: we used to "delete" tasks when they became inactive,
+        # but with a pluggable state storage, you might very well want to keep some history of
+        # older tasks as well. That's why we call it "inactivate" (as in the verb)
         for task in delete_tasks:
             self._tasks.pop(task)
 
-    def get_workers(self, last_active_lt=None):
+    def get_active_workers(self, last_active_lt=None):
         for worker in self._active_workers.itervalues():
             if last_active_lt is not None and worker.last_active >= last_active_lt:
                 continue
@@ -191,7 +196,7 @@ class CentralPlannerScheduler(Scheduler):
         logger.info("Starting pruning of task graph")
         # Delete workers that haven't said anything for a while (probably killed)
         delete_workers = []
-        for worker in self._state.get_workers(last_active_lt=time.time() - self._worker_disconnect_delay):
+        for worker in self._state.get_active_workers(last_active_lt=time.time() - self._worker_disconnect_delay):
             logger.info("Worker %s timed out (no contact for >=%ss)", worker, self._worker_disconnect_delay)
             delete_workers.append(worker.id)
 
@@ -200,7 +205,7 @@ class CentralPlannerScheduler(Scheduler):
         delete_workers = set(delete_workers)
 
         # Mark tasks with no remaining active stakeholders for deletion
-        for task in self._state.get_tasks():
+        for task in self._state.get_active_tasks():
             task.stakeholders.difference_update(delete_workers)
             if not task.stakeholders:
                 if task.remove is None:
@@ -216,7 +221,7 @@ class CentralPlannerScheduler(Scheduler):
 
         # Remove tasks that have no stakeholders
         remove_tasks = []
-        for task in self._state.get_tasks():
+        for task in self._state.get_active_tasks():
             if task.remove and time.time() > task.remove:
                 logger.info("Removing task %r (no connected stakeholders)", task.id)
                 remove_tasks.append(task.id)
@@ -224,7 +229,7 @@ class CentralPlannerScheduler(Scheduler):
         self._state.inactivate_tasks(remove_tasks)
 
         # Reset FAILED tasks to PENDING if max timeout is reached, and retry delay is >= 0
-        for task in self._state.get_tasks():
+        for task in self._state.get_active_tasks():
             if task.status == FAILED and self._retry_delay >= 0 and task.retry < time.time():
                 task.status = PENDING
         logger.info("Done pruning task graph")
@@ -291,7 +296,7 @@ class CentralPlannerScheduler(Scheduler):
         locally_pending_tasks = 0
         running_tasks = []
 
-        for task in self._state.get_tasks():
+        for task in self._state.get_active_tasks():
             if worker not in task.workers:
                 continue
 
@@ -377,7 +382,7 @@ class CentralPlannerScheduler(Scheduler):
     def graph(self):
         self.prune()
         serialized = {}
-        for task in self._state.get_tasks():
+        for task in self._state.get_active_tasks():
             serialized[task.id] = self._serialize_task(task.id)
         return serialized
 
@@ -418,7 +423,7 @@ class CentralPlannerScheduler(Scheduler):
         self.prune()
         result = {}
         upstream_status_table = {}  # used to memoize upstream status
-        for task in self._state.get_tasks():
+        for task in self._state.get_active_tasks():
             if not status or task.status == status:
                 if (task.status != PENDING or not upstream_status or
                     upstream_status == self._upstream_status(task.id, upstream_status_table)):
@@ -438,7 +443,7 @@ class CentralPlannerScheduler(Scheduler):
         serialized[task_id] = self._serialize_task(task_id)
         while len(stack) > 0:
             curr_id = stack.pop()
-            for task in self._state.get_tasks():
+            for task in self._state.get_active_tasks():
                 if curr_id in task.deps:
                     serialized[curr_id]["deps"].append(task.id)
                     if task.id not in serialized:
@@ -450,7 +455,7 @@ class CentralPlannerScheduler(Scheduler):
         ''' query for a subset of tasks by task_id '''
         self.prune()
         result = collections.defaultdict(dict)
-        for task in self._state.get_tasks():
+        for task in self._state.get_active_tasks():
             if task.id.find(task_str) != -1:
                 serialized = self._serialize_task(task.id)
                 result[task.status][task.id] = serialized
